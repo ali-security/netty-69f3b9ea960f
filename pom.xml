@@ -1273,6 +1273,13 @@
                   <new>method io.netty.channel.unix.DomainSocketAddress io.netty.channel.unix.Socket::remoteDomainSocketAddress()</new>
                   <justification>Acceptable incompatibility for required change</justification>
                 </item>
+                <item>
+                  <ignore>true</ignore>
+                  <code>java.method.finalMethodAddedToNonFinalClass</code>
+                  <regex>true</regex>
+                  <new>method void io\.netty\.handler\.codec\.http\.HttpObjectDecoder::clearContentLength\(\).*</new>
+                  <justification>Acceptable incompatibility for required security change (CVE-2026-42585)</justification>
+                </item>
               </differences>
             </revapi.differences>
           </analysisConfiguration>

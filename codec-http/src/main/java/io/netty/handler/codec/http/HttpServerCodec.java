@@ -16,7 +16,9 @@
 package io.netty.handler.codec.http;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelPromise;
 import io.netty.channel.CombinedChannelDuplexHandler;
 
 import java.util.ArrayDeque;
@@ -38,6 +40,11 @@ public final class HttpServerCodec extends CombinedChannelDuplexHandler<HttpRequ
 
     /** A queue that is used for correlating a request and a response. */
     private final Queue<HttpMethod> queue = new ArrayDeque<HttpMethod>();
+
+    /**
+     * When set, the connection will be closed after the next response is written.
+     */
+    private boolean mustCloseAfterResponse;
 
     /**
      * Creates a new instance with the default decoder options
@@ -96,6 +103,13 @@ public final class HttpServerCodec extends CombinedChannelDuplexHandler<HttpRequ
     }
 
     /**
+     * Creates a new instance with the specified {@link HttpDecoderConfig}.
+     */
+    public HttpServerCodec(HttpDecoderConfig config) {
+        init(new HttpServerRequestDecoder(config), new HttpServerResponseEncoder());
+    }
+
+    /**
      * Upgrades to another protocol from HTTP. Removes the {@link HttpRequestDecoder} and
      * {@link HttpResponseEncoder} from the pipeline.
      */
@@ -134,6 +148,10 @@ public final class HttpServerCodec extends CombinedChannelDuplexHandler<HttpRequ
                   allowDuplicateContentLengths, allowPartialChunks);
         }
 
+        HttpServerRequestDecoder(HttpDecoderConfig config) {
+            super(config);
+        }
+
         @Override
         protected void decode(ChannelHandlerContext ctx, ByteBuf buffer, List<Object> out) throws Exception {
             int oldSize = out.size();
@@ -146,11 +164,26 @@ public final class HttpServerCodec extends CombinedChannelDuplexHandler<HttpRequ
                 }
             }
         }
+
+        @Override
+        protected void handleTransferEncodingChunkedWithContentLength(HttpMessage message) {
+            super.handleTransferEncodingChunkedWithContentLength(message);
+            mustCloseAfterResponse = true;
+        }
     }
 
     private final class HttpServerResponseEncoder extends HttpResponseEncoder {
 
         private HttpMethod method;
+
+        @Override
+        public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
+            if (mustCloseAfterResponse && msg instanceof LastHttpContent) {
+                mustCloseAfterResponse = false;
+                promise = promise.unvoid().addListener(ChannelFutureListener.CLOSE);
+            }
+            super.write(ctx, msg, promise);
+        }
 
         @Override
         protected void sanitizeHeadersBeforeEncode(HttpResponse msg, boolean isAlwaysEmpty) {
