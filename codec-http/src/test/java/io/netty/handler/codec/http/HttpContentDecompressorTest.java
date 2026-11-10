@@ -23,8 +23,12 @@ import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelOutboundHandlerAdapter;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.handler.codec.compression.Brotli;
+import io.netty.handler.codec.compression.CompressionOptions;
+import io.netty.handler.codec.compression.DecompressionException;
 import io.netty.handler.codec.compression.Zstd;
+import io.netty.util.ReferenceCountUtil;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.function.Executable;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
 
@@ -34,9 +38,15 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class HttpContentDecompressorTest {
+
+    private static final int MAX_ALLOCATION = 64 * 1024;
+    private static final int BOMB_CHUNK_SIZE = 16 * 1024;
+    // 512 KiB of zeros once decompressed, eight times the configured maxAllocation.
+    private static final int BOMB_CHUNKS = 32;
 
     // See https://github.com/netty/netty/issues/8915.
     @Test
@@ -146,6 +156,182 @@ public class HttpContentDecompressorTest {
         assertEquals((long) chunkSize * numberOfChunks, incomingHandler.total);
     }
 
+    static String[] maxAllocationEncodings() {
+        List<String> encodings = new ArrayList<String>();
+        encodings.add("gzip");
+        encodings.add("deflate");
+        if (Brotli.isAvailable()) {
+            encodings.add("br");
+        }
+        encodings.add("snappy");
+        return encodings.toArray(new String[0]);
+    }
+
+    // See CVE-2026-42587: a small compressed body must not decompress past the configured maxAllocation.
+    @ParameterizedTest
+    @MethodSource("maxAllocationEncodings")
+    public void testDecompressionBombRejectedWithMaxAllocation(String encoding) {
+        final ByteBuf compressed = concat(compressZeros(encoding, BOMB_CHUNK_SIZE, BOMB_CHUNKS));
+        assertTrue(compressed.readableBytes() < MAX_ALLOCATION);
+
+        ContentCountingHandler counter = new ContentCountingHandler();
+        final EmbeddedChannel channel = new EmbeddedChannel(new HttpContentDecompressor(MAX_ALLOCATION), counter);
+        channel.writeInbound(newCompressedResponse(encoding));
+        assertThrows(DecompressionException.class, new Executable() {
+            @Override
+            public void execute() {
+                channel.writeInbound(new DefaultLastHttpContent(compressed));
+            }
+        });
+
+        assertTrue(counter.contentBytes <= MAX_ALLOCATION,
+                "decompressed " + counter.contentBytes + " bytes, limit is " + MAX_ALLOCATION);
+        assertFalse(channel.finishAndReleaseAll());
+    }
+
+    // Every chunk stays below maxAllocation on its own, the limit must hold for the whole message and
+    // must be reported only once, not once per chunk of the remaining bomb.
+    @ParameterizedTest
+    @MethodSource("maxAllocationEncodings")
+    public void testDecompressionBombAcrossChunksRejectedOnce(String encoding) {
+        List<ByteBuf> chunks = compressZeros(encoding, BOMB_CHUNK_SIZE, BOMB_CHUNKS);
+
+        ContentCountingHandler counter = new ContentCountingHandler();
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpContentDecompressor(MAX_ALLOCATION), counter);
+        channel.writeInbound(newCompressedResponse(encoding));
+        int failures = 0;
+        for (ByteBuf chunk : chunks) {
+            try {
+                channel.writeInbound(new DefaultHttpContent(chunk));
+            } catch (DecompressionException expected) {
+                failures++;
+            }
+        }
+        channel.writeInbound(LastHttpContent.EMPTY_LAST_CONTENT);
+
+        assertEquals(1, failures);
+        assertTrue(counter.contentBytes <= MAX_ALLOCATION,
+                "decompressed " + counter.contentBytes + " bytes, limit is " + MAX_ALLOCATION);
+        assertTrue(counter.lastContentReceived);
+        assertFalse(channel.finishAndReleaseAll());
+    }
+
+    @ParameterizedTest
+    @MethodSource("maxAllocationEncodings")
+    public void testDecompressionWithinMaxAllocation(String encoding) {
+        int numberOfChunks = 3;
+        List<ByteBuf> chunks = compressZeros(encoding, BOMB_CHUNK_SIZE, numberOfChunks);
+
+        ContentCountingHandler counter = new ContentCountingHandler();
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpContentDecompressor(MAX_ALLOCATION), counter);
+        channel.writeInbound(newCompressedResponse(encoding));
+        for (ByteBuf chunk : chunks) {
+            channel.writeInbound(new DefaultHttpContent(chunk));
+        }
+        channel.writeInbound(LastHttpContent.EMPTY_LAST_CONTENT);
+
+        assertEquals((long) BOMB_CHUNK_SIZE * numberOfChunks, counter.contentBytes);
+        assertTrue(counter.lastContentReceived);
+        assertFalse(channel.finishAndReleaseAll());
+    }
+
+    @ParameterizedTest
+    @MethodSource("maxAllocationEncodings")
+    public void testDecompressionUnlimitedByDefault(String encoding) {
+        HttpContentDecompressor[] decompressors = {
+                new HttpContentDecompressor(), new HttpContentDecompressor(0), new HttpContentDecompressor(true, 0)
+        };
+        for (HttpContentDecompressor decompressor : decompressors) {
+            ByteBuf compressed = concat(compressZeros(encoding, BOMB_CHUNK_SIZE, BOMB_CHUNKS));
+
+            ContentCountingHandler counter = new ContentCountingHandler();
+            EmbeddedChannel channel = new EmbeddedChannel(decompressor, counter);
+            channel.writeInbound(newCompressedResponse(encoding));
+            channel.writeInbound(new DefaultLastHttpContent(compressed));
+
+            assertEquals((long) BOMB_CHUNK_SIZE * BOMB_CHUNKS, counter.contentBytes);
+            assertTrue(counter.lastContentReceived);
+            assertFalse(channel.finishAndReleaseAll());
+        }
+    }
+
+    @Test
+    public void testNegativeMaxAllocationRejected() {
+        assertThrows(IllegalArgumentException.class, new Executable() {
+            @Override
+            public void execute() {
+                new HttpContentDecompressor(-1);
+            }
+        });
+        assertThrows(IllegalArgumentException.class, new Executable() {
+            @Override
+            public void execute() {
+                new HttpContentDecompressor(true, -1);
+            }
+        });
+    }
+
+    private static HttpResponse newCompressedResponse(String encoding) {
+        HttpResponse response = new DefaultHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK);
+        response.headers().set(HttpHeaderNames.CONTENT_ENCODING, encoding);
+        response.headers().set(HttpHeaderNames.TRANSFER_ENCODING, HttpHeaderValues.CHUNKED);
+        return response;
+    }
+
+    /**
+     * Compresses {@code numberOfChunks} chunks of {@code chunkSize} zeros with the given encoding and returns the
+     * compressed form of every chunk, followed by the trailer the encoder emits when the message ends.
+     */
+    private static List<ByteBuf> compressZeros(String encoding, int chunkSize, int numberOfChunks) {
+        // Passing no CompressionOptions enables every available encoding, including br and snappy.
+        EmbeddedChannel compressionChannel = new EmbeddedChannel(
+                new HttpContentCompressor((CompressionOptions[]) null));
+        DefaultFullHttpRequest req = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/");
+        req.headers().set(HttpHeaderNames.ACCEPT_ENCODING, encoding);
+        compressionChannel.writeInbound(req);
+
+        DefaultHttpResponse response = new DefaultHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK);
+        response.headers().set(HttpHeaderNames.TRANSFER_ENCODING, HttpHeaderValues.CHUNKED);
+        compressionChannel.writeOutbound(response);
+        HttpResponse encodedResponse = compressionChannel.readOutbound();
+        assertEquals(encoding, encodedResponse.headers().get(HttpHeaderNames.CONTENT_ENCODING));
+
+        List<ByteBuf> chunks = new ArrayList<ByteBuf>();
+        for (int i = 0; i < numberOfChunks; i++) {
+            ByteBuf buffer = compressionChannel.alloc().buffer(chunkSize);
+            buffer.writeZero(chunkSize);
+            compressionChannel.writeOutbound(new DefaultHttpContent(buffer));
+            chunks.add(readCompressedContent(compressionChannel));
+        }
+        compressionChannel.writeOutbound(LastHttpContent.EMPTY_LAST_CONTENT);
+        chunks.add(readCompressedContent(compressionChannel));
+        compressionChannel.finishAndReleaseAll();
+        return chunks;
+    }
+
+    private static ByteBuf readCompressedContent(EmbeddedChannel channel) {
+        ByteBuf compressed = Unpooled.buffer();
+        for (;;) {
+            Object obj = channel.readOutbound();
+            if (obj == null) {
+                return compressed;
+            }
+            if (obj instanceof HttpContent) {
+                compressed.writeBytes(((HttpContent) obj).content());
+            }
+            ReferenceCountUtil.release(obj);
+        }
+    }
+
+    private static ByteBuf concat(List<ByteBuf> buffers) {
+        ByteBuf result = Unpooled.buffer();
+        for (ByteBuf buffer : buffers) {
+            result.writeBytes(buffer);
+            buffer.release();
+        }
+        return result;
+    }
+
     private static final class ZipBombIncomingHandler extends ChannelInboundHandlerAdapter {
         final int memoryLimit;
         long total;
@@ -165,6 +351,22 @@ public class HttpContentDecompressorTest {
                 total += buf.content().readableBytes();
                 buf.release();
             }
+        }
+    }
+
+    private static final class ContentCountingHandler extends ChannelInboundHandlerAdapter {
+        long contentBytes;
+        boolean lastContentReceived;
+
+        @Override
+        public void channelRead(ChannelHandlerContext ctx, Object msg) {
+            if (msg instanceof HttpContent) {
+                contentBytes += ((HttpContent) msg).content().readableBytes();
+                if (msg instanceof LastHttpContent) {
+                    lastContentReceived = true;
+                }
+            }
+            ReferenceCountUtil.release(msg);
         }
     }
 }

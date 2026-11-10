@@ -63,6 +63,13 @@
     "queryAllPublicMethods": true
   },
   {
+    "name": "io.netty.handler.codec.http.HttpDecompressionAllocationGuard",
+    "condition": {
+      "typeReachable": "io.netty.handler.codec.http.HttpDecompressionAllocationGuard"
+    },
+    "queryAllPublicMethods": true
+  },
+  {
     "name": "io.netty.handler.codec.http.HttpContentEncoder",
     "condition": {
       "typeReachable": "io.netty.handler.codec.http.HttpContentEncoder"
