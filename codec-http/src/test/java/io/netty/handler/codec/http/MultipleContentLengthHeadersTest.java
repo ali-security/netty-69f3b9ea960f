@@ -53,13 +53,9 @@ public class MultipleContentLengthHeadersTest {
     }
 
     private static EmbeddedChannel newChannel(boolean allowDuplicateContentLengths) {
-        HttpRequestDecoder decoder = new HttpRequestDecoder(
-                DEFAULT_MAX_INITIAL_LINE_LENGTH,
-                DEFAULT_MAX_HEADER_SIZE,
-                DEFAULT_MAX_CHUNK_SIZE,
-                DEFAULT_VALIDATE_HEADERS,
-                DEFAULT_INITIAL_BUFFER_SIZE,
-                allowDuplicateContentLengths);
+        HttpDecoderConfig config = new HttpDecoderConfig()
+                .setAllowDuplicateContentLengths(allowDuplicateContentLengths);
+        HttpRequestDecoder decoder = new HttpRequestDecoder(config);
         return new EmbeddedChannel(decoder);
     }
 
@@ -106,7 +102,10 @@ public class MultipleContentLengthHeadersTest {
 
     @Test
     public void testDanglingComma() {
-        EmbeddedChannel channel = newChannel(false);
+        HttpDecoderConfig config = new HttpDecoderConfig()
+                .setAllowDuplicateContentLengths(false)
+                .setStrictLineParsing(false);  // Allow LF-only for this test
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpRequestDecoder(config));
         String requestStr = "GET /some/path HTTP/1.1\r\n" +
                             "Content-Length: 1,\r\n" +
                             "Connection: close\n\n" +

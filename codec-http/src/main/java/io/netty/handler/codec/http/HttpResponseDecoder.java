@@ -149,6 +149,13 @@ public class HttpResponseDecoder extends HttpObjectDecoder {
               initialBufferSize, allowDuplicateContentLengths, allowPartialChunks);
     }
 
+    /**
+     * Creates a new instance with the specified HttpDecoderConfig.
+     */
+    public HttpResponseDecoder(HttpDecoderConfig config) {
+        super(config);
+    }
+
     @Override
     protected HttpMessage createMessage(String[] initialLine) {
         return new DefaultHttpResponse(

@@ -18,6 +18,7 @@ package io.netty.handler.codec.http;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.handler.codec.DecoderResult;
 import io.netty.handler.codec.PrematureChannelClosureException;
 import io.netty.util.CharsetUtil;
 import org.junit.jupiter.api.Test;
@@ -1012,7 +1013,9 @@ public class HttpResponseDecoderTest {
 
     @Test
     public void testWhitespace() {
-        EmbeddedChannel channel = new EmbeddedChannel(new HttpResponseDecoder());
+        HttpDecoderConfig config = new HttpDecoderConfig()
+                .setStrictLineParsing(false);  // Allow LF-only for this test
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpResponseDecoder(config));
         String requestStr = "HTTP/1.1 200 OK\r\n" +
                 "Transfer-Encoding : chunked\r\n" +
                 "Host: netty.io\n\r\n";
@@ -1120,6 +1123,63 @@ public class HttpResponseDecoderTest {
         HttpResponse response = channel.readInbound();
         assertThat(response.decoderResult().cause(), instanceOf(IllegalArgumentException.class));
         assertTrue(response.decoderResult().isFailure());
+        assertFalse(channel.finish());
+    }
+
+    @Test
+    void mustRejectImproperlyTerminatedChunkExtensions() throws Exception {
+        // See full explanation: https://w4ke.info/2025/06/18/funky-chunks.html
+        String requestStr = "HTTP/1.1 200 OK\r\n" +
+                "Transfer-Encoding: chunked\r\n" +
+                "\r\n" +
+                "2;\n" + // Chunk size followed by illegal single newline (not preceded by carraige return)
+                "xx\r\n" +
+                "1D\r\n" +
+                "0\r\n\r\n" +
+                "HTTP/1.1 200 OK\r\n" +
+                "Transfer-Encoding: chunked\r\n\r\n" +
+                "0\r\n\r\n";
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpResponseDecoder());
+        assertTrue(channel.writeInbound(Unpooled.copiedBuffer(requestStr, CharsetUtil.US_ASCII)));
+        HttpResponse response = channel.readInbound();
+        assertFalse(response.decoderResult().isFailure()); // We parse the headers just fine.
+        assertTrue(response.headers().names().contains("Transfer-Encoding"));
+        assertTrue(response.headers().contains("Transfer-Encoding", "chunked", false));
+        HttpContent content = channel.readInbound();
+        DecoderResult decoderResult = content.decoderResult();
+        assertTrue(decoderResult.isFailure()); // But parsing the chunk must fail.
+        assertThat(decoderResult.cause(), instanceOf(InvalidChunkExtensionException.class));
+        content.release();
+        assertFalse(channel.finish());
+    }
+
+    @Test
+    void mustRejectImproperlyTerminatedChunkBodies() throws Exception {
+        // See full explanation: https://w4ke.info/2025/06/18/funky-chunks.html
+        String requestStr = "HTTP/1.1 200 OK\r\n" +
+                "Transfer-Encoding: chunked\r\n\r\n" +
+                "5\r\n" +
+                "AAAAXX" + // Chunk body contains extra (XX) bytes, and no CRLF terminator.
+                "1D\r\n" +
+                "0\r\n" +
+                "HTTP/1.1 200 OK\r\n" +
+                "Transfer-Encoding: chunked\r\n\r\n" +
+                "0\r\n\r\n";
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpResponseDecoder());
+        assertTrue(channel.writeInbound(Unpooled.copiedBuffer(requestStr, CharsetUtil.US_ASCII)));
+        HttpResponse response = channel.readInbound();
+        assertFalse(response.decoderResult().isFailure()); // We parse the headers just fine.
+        assertTrue(response.headers().names().contains("Transfer-Encoding"));
+        assertTrue(response.headers().contains("Transfer-Encoding", "chunked", false));
+        HttpContent content = channel.readInbound();
+        assertFalse(content.decoderResult().isFailure()); // We parse the content promised by the chunk length.
+        content.release();
+
+        content = channel.readInbound();
+        DecoderResult decoderResult = content.decoderResult();
+        assertTrue(decoderResult.isFailure()); // But then parsing the chunk delimiter must fail.
+        assertThat(decoderResult.cause(), instanceOf(InvalidChunkTerminationException.class));
+        content.release();
         assertFalse(channel.finish());
     }
 }

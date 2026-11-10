@@ -18,6 +18,7 @@ package io.netty.handler.codec.http;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.handler.codec.DecoderResult;
 import io.netty.util.AsciiString;
 import io.netty.util.CharsetUtil;
 import org.junit.jupiter.api.Test;
@@ -83,30 +84,51 @@ public class HttpRequestDecoderTest {
     }
 
     @Test
+    public void testDecodeWholeRequestAtOnceFailesWithLFDelimiters() {
+        testDecodeWholeRequestAtOnce(CONTENT_LF_DELIMITERS, HttpObjectDecoder.DEFAULT_MAX_HEADER_SIZE, true, true);
+    }
+
+    @Test
+    public void testDecodeWholeRequestAtOnceFailsWithMixedDelimiters() {
+        testDecodeWholeRequestAtOnce(CONTENT_MIXED_DELIMITERS, HttpObjectDecoder.DEFAULT_MAX_HEADER_SIZE, true, true);
+    }
+
+    @Test
     public void testDecodeWholeRequestAtOnceMixedDelimitersWithIntegerOverflowOnMaxBodySize() {
         testDecodeWholeRequestAtOnce(CONTENT_MIXED_DELIMITERS, Integer.MAX_VALUE);
         testDecodeWholeRequestAtOnce(CONTENT_MIXED_DELIMITERS, Integer.MAX_VALUE - 1);
     }
 
     private static void testDecodeWholeRequestAtOnce(byte[] content) {
-        testDecodeWholeRequestAtOnce(content, HttpRequestDecoder.DEFAULT_MAX_HEADER_SIZE);
+        testDecodeWholeRequestAtOnce(content, HttpObjectDecoder.DEFAULT_MAX_HEADER_SIZE, false, false);
     }
 
     private static void testDecodeWholeRequestAtOnce(byte[] content, int maxHeaderSize) {
-        EmbeddedChannel channel =
-                new EmbeddedChannel(new HttpRequestDecoder(HttpObjectDecoder.DEFAULT_MAX_INITIAL_LINE_LENGTH,
-                                                           maxHeaderSize,
-                                                           HttpObjectDecoder.DEFAULT_MAX_CHUNK_SIZE));
+        testDecodeWholeRequestAtOnce(content, maxHeaderSize, false, false);
+    }
+
+    private static void testDecodeWholeRequestAtOnce(byte[] content, int maxHeaderSize, boolean strictLineParsing,
+                                                     boolean expectFailure) {
+        HttpDecoderConfig config = new HttpDecoderConfig()
+                .setMaxHeaderSize(maxHeaderSize)
+                .setStrictLineParsing(strictLineParsing);
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpRequestDecoder(config));
         assertTrue(channel.writeInbound(Unpooled.copiedBuffer(content)));
         HttpRequest req = channel.readInbound();
         assertNotNull(req);
-        checkHeaders(req.headers());
-        LastHttpContent c = channel.readInbound();
-        assertEquals(CONTENT_LENGTH, c.content().readableBytes());
-        assertEquals(
-                Unpooled.wrappedBuffer(content, content.length - CONTENT_LENGTH, CONTENT_LENGTH),
-                c.content().readSlice(CONTENT_LENGTH));
-        c.release();
+        if (expectFailure) {
+            assertTrue(req.decoderResult().isFailure());
+            assertThat(req.decoderResult().cause(), instanceOf(InvalidLineSeparatorException.class));
+        } else {
+            assertFalse(req.decoderResult().isFailure());
+            checkHeaders(req.headers());
+            LastHttpContent c = channel.readInbound();
+            assertEquals(CONTENT_LENGTH, c.content().readableBytes());
+            assertEquals(
+                    Unpooled.wrappedBuffer(content, content.length - CONTENT_LENGTH, CONTENT_LENGTH),
+                    c.content().readSlice(CONTENT_LENGTH));
+            c.release();
+        }
 
         assertFalse(channel.finish());
         assertNull(channel.readInbound());
@@ -131,27 +153,41 @@ public class HttpRequestDecoderTest {
 
     @Test
     public void testDecodeWholeRequestInMultipleStepsCRLFDelimiters() {
-        testDecodeWholeRequestInMultipleSteps(CONTENT_CRLF_DELIMITERS);
+        testDecodeWholeRequestInMultipleSteps(CONTENT_CRLF_DELIMITERS, true, false);
     }
 
     @Test
     public void testDecodeWholeRequestInMultipleStepsLFDelimiters() {
-        testDecodeWholeRequestInMultipleSteps(CONTENT_LF_DELIMITERS);
+        testDecodeWholeRequestInMultipleSteps(CONTENT_LF_DELIMITERS, false, false);
     }
 
     @Test
     public void testDecodeWholeRequestInMultipleStepsMixedDelimiters() {
-        testDecodeWholeRequestInMultipleSteps(CONTENT_MIXED_DELIMITERS);
+        testDecodeWholeRequestInMultipleSteps(CONTENT_MIXED_DELIMITERS, false, false);
     }
 
-    private static void testDecodeWholeRequestInMultipleSteps(byte[] content) {
+    @Test
+    public void testDecodeWholeRequestInMultipleStepsFailsWithLFDelimiters() {
+        testDecodeWholeRequestInMultipleSteps(CONTENT_LF_DELIMITERS, true, true);
+    }
+
+    @Test
+    public void testDecodeWholeRequestInMultipleStepsFailsWithMixedDelimiters() {
+        testDecodeWholeRequestInMultipleSteps(CONTENT_MIXED_DELIMITERS, true, true);
+    }
+
+    private static void testDecodeWholeRequestInMultipleSteps(
+            byte[] content, boolean strictLineParsing, boolean expectFailure) {
         for (int i = 1; i < content.length; i++) {
-            testDecodeWholeRequestInMultipleSteps(content, i);
+            testDecodeWholeRequestInMultipleSteps(content, i, strictLineParsing, expectFailure);
         }
     }
 
-    private static void testDecodeWholeRequestInMultipleSteps(byte[] content, int fragmentSize) {
-        EmbeddedChannel channel = new EmbeddedChannel(new HttpRequestDecoder());
+    private static void testDecodeWholeRequestInMultipleSteps(
+            byte[] content, int fragmentSize, boolean strictLineParsing, boolean expectFailure) {
+        HttpDecoderConfig config = new HttpDecoderConfig()
+                .setStrictLineParsing(strictLineParsing);
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpRequestDecoder(config));
         int headerLength = content.length - CONTENT_LENGTH;
 
         // split up the header
@@ -173,6 +209,12 @@ public class HttpRequestDecoderTest {
 
         HttpRequest req = channel.readInbound();
         assertNotNull(req);
+        if (expectFailure) {
+            assertTrue(req.decoderResult().isFailure());
+            assertThat(req.decoderResult().cause(), instanceOf(InvalidLineSeparatorException.class));
+            return; // No more messages will be produced.
+        }
+        assertFalse(req.decoderResult().isFailure());
         checkHeaders(req.headers());
 
         for (int i = CONTENT_LENGTH; i > 1; i --) {
