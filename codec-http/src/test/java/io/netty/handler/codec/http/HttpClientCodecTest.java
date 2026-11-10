@@ -361,19 +361,22 @@ public class HttpClientCodecTest {
 
     @Test
     public void testInformationalResponseKeepsPairsInSync() {
-        byte[] data = ("HTTP/1.1 102 Processing\r\n" +
+        String data = "HTTP/1.1 102 Processing\r\n" +
                 "Status-URI: Status-URI:http://status.com; 404\r\n" +
-                "\r\n").getBytes();
-        byte[] data2 = ("HTTP/1.1 200 OK\r\n" +
+                "\r\n" +
+                "HTTP/1.1 200 OK\r\n" +
+                "Content-Length: 5\r\n" +
+                "\r\n"; // No contents; we're responding to a HEAD request.
+        String data2 = "HTTP/1.1 200 OK\r\n" +
                 "Content-Length: 8\r\n" +
                 "\r\n" +
-                "12345678").getBytes();
+                "12345678";
         EmbeddedChannel ch = new EmbeddedChannel(new HttpClientCodec());
         assertTrue(ch.writeOutbound(new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.HEAD, "/")));
         ByteBuf buffer = ch.readOutbound();
         buffer.release();
         assertNull(ch.readOutbound());
-        assertTrue(ch.writeInbound(Unpooled.wrappedBuffer(data)));
+        assertTrue(ch.writeInbound(Unpooled.wrappedBuffer(data.getBytes(CharsetUtil.ISO_8859_1))));
         HttpResponse res = ch.readInbound();
         assertThat(res.protocolVersion(), sameInstance(HttpVersion.HTTP_1_1));
         assertThat(res.status(), is(HttpResponseStatus.PROCESSING));
@@ -382,12 +385,21 @@ public class HttpClientCodecTest {
         assertThat(content.content().readableBytes(), is(0));
         assertThat(content, instanceOf(LastHttpContent.class));
         content.release();
+        res = ch.readInbound();
+        assertThat(res.protocolVersion(), sameInstance(HttpVersion.HTTP_1_1));
+        assertThat(res.status(), is(HttpResponseStatus.OK));
+        // If it had not been a HEAD request, server *would* have sent 5 bytes of contents...
+        assertThat(res.headers().getInt(HttpHeaderNames.CONTENT_LENGTH), is(5));
+        content = ch.readInbound();
+        // ... but it is a HEAD request, so we get zero bytes.
+        assertThat(content.content().readableBytes(), is(0));
+        content.release();
 
         assertTrue(ch.writeOutbound(new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/")));
         buffer = ch.readOutbound();
         buffer.release();
         assertNull(ch.readOutbound());
-        assertTrue(ch.writeInbound(Unpooled.wrappedBuffer(data2)));
+        assertTrue(ch.writeInbound(Unpooled.wrappedBuffer(data2.getBytes(CharsetUtil.ISO_8859_1))));
 
         res = ch.readInbound();
         assertThat(res.protocolVersion(), sameInstance(HttpVersion.HTTP_1_1));
@@ -399,6 +411,51 @@ public class HttpClientCodecTest {
         content.release();
 
         assertThat(ch.finish(), is(false));
+    }
+
+    @Test
+    public void testInformationalFollowedByResponse() {
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpClientCodec());
+
+        assertTrue(channel.writeOutbound(new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/1")));
+        ByteBuf request = channel.readOutbound();
+        request.release();
+        assertNull(channel.readOutbound());
+
+        assertTrue(channel.writeOutbound(new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.HEAD, "/2")));
+        request = channel.readOutbound();
+        request.release();
+        assertNull(channel.readOutbound());
+
+        String responseStr =
+                "HTTP/1.1 103 Early Hints\r\n\r\n" +
+                "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello" +
+                "HTTP/1.1 200 OK\r\n\r\n";
+        assertTrue(channel.writeInbound(Unpooled.copiedBuffer(responseStr, CharsetUtil.US_ASCII)));
+
+        // Response 1: Early hints to first GET request.
+        HttpResponse response = channel.readInbound();
+        assertThat(response.status(), is(HttpResponseStatus.EARLY_HINTS));
+        LastHttpContent last = channel.readInbound();
+        assertThat(last.content().readableBytes(), is(0));
+        last.release();
+
+        // Response 2: Actual response, with contents, to first GET request.
+        response = channel.readInbound();
+        assertThat(response.status(), is(HttpResponseStatus.OK));
+        assertThat(response.headers().getInt(HttpHeaderNames.CONTENT_LENGTH), is(5));
+        last = channel.readInbound();
+        assertThat(last.content().readableBytes(), is(5));
+        last.release();
+
+        // Response 3: Actual response, with no contents, to second HEAD request.
+        response = channel.readInbound();
+        assertThat(response.status(), is(HttpResponseStatus.OK));
+        last = channel.readInbound();
+        assertThat(last.content().readableBytes(), is(0));
+        last.release();
+
+        assertThat(channel.finish(), is(false));
     }
 
     @Test
