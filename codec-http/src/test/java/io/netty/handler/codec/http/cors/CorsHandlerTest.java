@@ -46,6 +46,8 @@ import static io.netty.handler.codec.http.cors.CorsConfigBuilder.*;
 import static org.hamcrest.CoreMatchers.*;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.core.IsEqual.equalTo;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class CorsHandlerTest {
 
@@ -506,6 +508,24 @@ public class CorsHandlerTest {
 
         assertThat(response.headers().get(ACCESS_CONTROL_ALLOW_PRIVATE_NETWORK), equalTo("false"));
         assertThat(ReferenceCountUtil.release(response), is(true));
+    }
+
+    @Test
+    public void shortCircuitWithNullOriginNotAllowedShouldBeForbidden() {
+        final CorsConfig config = forOrigin("http://localhost:8080").shortCircuit().build();
+        final HttpResponse response = simpleRequest(config, "null");
+        assertEquals(FORBIDDEN, response.status());
+        assertEquals("0", response.headers().get(CONTENT_LENGTH));
+        assertTrue(ReferenceCountUtil.release(response));
+    }
+
+    @Test
+    public void shortCircuitWithNullOriginAllowedShouldSucceed() {
+        final CorsConfig config = forOrigin("http://localhost:8080").allowNullOrigin().shortCircuit().build();
+        final HttpResponse response = simpleRequest(config, "null");
+        assertEquals(OK, response.status());
+        assertEquals("null", response.headers().get(ACCESS_CONTROL_ALLOW_ORIGIN));
+        assertTrue(ReferenceCountUtil.release(response));
     }
 
     private static HttpResponse simpleRequest(final CorsConfig config, final String origin) {
