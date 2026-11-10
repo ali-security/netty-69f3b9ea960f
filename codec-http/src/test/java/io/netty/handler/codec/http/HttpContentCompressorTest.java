@@ -35,6 +35,7 @@ import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.channel.local.LocalAddress;
 import io.netty.channel.local.LocalChannel;
 import io.netty.channel.local.LocalServerChannel;
+import io.netty.handler.codec.DecoderException;
 import io.netty.handler.codec.DecoderResult;
 import io.netty.handler.codec.EncoderException;
 import io.netty.handler.codec.compression.Brotli;
@@ -50,6 +51,7 @@ import java.util.concurrent.TimeUnit;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIf;
+import org.junit.jupiter.api.function.Executable;
 
 import java.nio.charset.StandardCharsets;
 
@@ -64,6 +66,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -971,6 +974,42 @@ public class HttpContentCompressorTest {
 
         assertThat(ch.readOutbound(), is(nullValue()));
         assertTrue(ch.finishAndReleaseAll());
+    }
+
+    @Test
+    public void testPipelinedRequestsAreBoundedByDefaultMaxPipelineDepth() {
+        final EmbeddedChannel ch = new EmbeddedChannel(new HttpContentCompressor());
+        for (int i = 0; i < HttpContentEncoder.DEFAULT_MAX_PIPELINE_DEPTH; i++) {
+            assertTrue(ch.writeInbound(newRequest()));
+        }
+
+        assertThrows(DecoderException.class, new Executable() {
+            @Override
+            public void execute() throws Throwable {
+                ch.writeInbound(newRequest());
+            }
+        });
+
+        ch.finishAndReleaseAll();
+    }
+
+    @Test
+    public void testMaxPipelineDepthIsConfigurable() {
+        // (0, 2) binds the new (int contentSizeThreshold, int maxPipelineDepth, CompressionOptions...) ctor
+        // through phase-3 varargs resolution; there is no fixed-arity 2-int ctor (the deprecated family is
+        // 1/3/4-arg), so this cannot silently bind the legacy (compressionLevel, windowBits, memLevel) path.
+        final EmbeddedChannel ch = new EmbeddedChannel(new HttpContentCompressor(0, 2));
+        assertTrue(ch.writeInbound(newRequest()));
+        assertTrue(ch.writeInbound(newRequest()));
+
+        assertThrows(DecoderException.class, new Executable() {
+            @Override
+            public void execute() throws Throwable {
+                ch.writeInbound(newRequest());
+            }
+        });
+
+        ch.finishAndReleaseAll();
     }
 
     private static FullHttpRequest newRequest() {
