@@ -407,6 +407,98 @@ public class HttpRequestDecoderTest {
     }
 
     @Test
+    public void testNonCrlfControlBytesPrecedingRequestLineAreRejected() {
+        // RFC 9112 §2.2: servers SHOULD ignore "at least one empty line (CRLF)" before the
+        // request-line.  Non-CRLF control bytes are not part of this robustness allowance
+        // and must not be silently swallowed.
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpRequestDecoder());
+
+        ByteBuf buf = Unpooled.buffer();
+        buf.writeByte(0x00);   // NUL  — not an empty CRLF line
+        buf.writeByte(0x01);   // SOH  — not an empty CRLF line
+        buf.writeCharSequence(
+                "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                CharsetUtil.US_ASCII);
+
+        channel.writeInbound(buf);
+        HttpRequest req = channel.readInbound();
+
+        DecoderResult decoderResult = req.decoderResult();
+        assertTrue(decoderResult.isFailure(),
+                "Non-CRLF control bytes before the request-line must not be silently skipped");
+        org.assertj.core.api.Assertions.assertThat(decoderResult.cause())
+                .isInstanceOf(InvalidLineSeparatorException.class);
+
+        assertFalse(channel.finish());
+    }
+
+    @Test
+    public void testNonCrlfControlBytesBetweenEmptyLinesPrecedingRequestLineAreRejected() {
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpRequestDecoder());
+        String request = "\r\n\r\n\u000bGET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+
+        channel.writeInbound(Unpooled.copiedBuffer(request, CharsetUtil.US_ASCII));
+        HttpRequest req = channel.readInbound();
+        assertLeadingControlBytesRejected(req);
+
+        assertFalse(channel.finish());
+    }
+
+    @Test
+    public void testNonCrlfControlBytesPrecedingRequestLineInLaterBufferAreRejected() {
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpRequestDecoder());
+
+        assertFalse(channel.writeInbound(Unpooled.copiedBuffer("\r\n", CharsetUtil.US_ASCII)));
+        channel.writeInbound(Unpooled.copiedBuffer(
+                "\u0000GET / HTTP/1.1\r\nHost: example.com\r\n\r\n", CharsetUtil.US_ASCII));
+        HttpRequest req = channel.readInbound();
+        assertLeadingControlBytesRejected(req);
+
+        assertFalse(channel.finish());
+    }
+
+    @Test
+    public void testNonCrlfControlBytesPrecedingPipelinedRequestLineAreRejected() {
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpRequestDecoder());
+        String requests = "GET /first HTTP/1.1\r\nHost: example.com\r\n\r\n" +
+                "\u0001GET /second HTTP/1.1\r\nHost: example.com\r\n\r\n";
+
+        assertTrue(channel.writeInbound(Unpooled.copiedBuffer(requests, CharsetUtil.US_ASCII)));
+        HttpRequest first = channel.readInbound();
+        assertTrue(first.decoderResult().isSuccess());
+        assertEquals("/first", first.uri());
+        LastHttpContent last = channel.readInbound();
+        last.release();
+
+        HttpRequest second = channel.readInbound();
+        assertLeadingControlBytesRejected(second);
+
+        assertFalse(channel.finish());
+    }
+
+    @Test
+    public void testLeadingControlBytesSkippedWhenStrictLineParsingDisabled() {
+        EmbeddedChannel channel = new EmbeddedChannel(
+                new HttpRequestDecoder(new HttpDecoderConfig().setStrictLineParsing(false)));
+        String request = "\u0000\u0001\r\nGET /some/path HTTP/1.1\r\nHost: example.com\r\n\r\n";
+
+        assertTrue(channel.writeInbound(Unpooled.copiedBuffer(request, CharsetUtil.US_ASCII)));
+        HttpRequest req = channel.readInbound();
+        assertTrue(req.decoderResult().isSuccess());
+        assertEquals(HttpMethod.GET, req.method());
+        assertEquals("/some/path", req.uri());
+
+        assertTrue(channel.finishAndReleaseAll());
+    }
+
+    private static void assertLeadingControlBytesRejected(HttpRequest req) {
+        assertTrue(req.decoderResult().isFailure(),
+                "Non-CRLF control bytes before the request-line must not be silently skipped");
+        org.assertj.core.api.Assertions.assertThat(req.decoderResult().cause())
+                .isInstanceOf(InvalidLineSeparatorException.class);
+    }
+
+    @Test
     public void testTooLargeHeaders() {
         EmbeddedChannel channel = new EmbeddedChannel(new HttpRequestDecoder(1024, 10, 1024));
         String requestStr = "GET /some/path HTTP/1.1\r\n" +
