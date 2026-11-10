@@ -995,7 +995,7 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         }
         start += skipped;
         length -= skipped;
-        int result = 0;
+        long result = 0;
         for (int i = 0; i < length; i++) {
             final int digit = StringUtil.decodeHexNibble(hex[start + i]);
             if (digit == -1) {
@@ -1006,15 +1006,18 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
                         // empty case
                         throw new NumberFormatException();
                     }
-                    return result;
+                    return (int) result;
                 }
                 // non-hex char fail-fast path
                 throw new NumberFormatException();
             }
             result *= 16;
             result += digit;
+            if (result > Integer.MAX_VALUE) {
+                throw new NumberFormatException("Chunk size overflow: " + result);
+            }
         }
-        return result;
+        return (int) result;
     }
 
     private String[] splitInitialLine(ByteBuf asciiBuffer) {
